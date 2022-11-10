@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.utils.data as Data
 import torch.nn as nn
+from torch import optim
 
 # 数据部分
 # 首先就是数据预处理部分，这里为了训练方便，并没有用什么大型数据集，主要是为了更关注模型本身实现
@@ -19,7 +20,7 @@ src_vocab_size = len(src_vocab)
 
 tgt_vocab = {'P':0,'i':1,'want':2,'a':3,'beer':4,'coke':5,'S':6,'E':7,'.':8}
 tgt_vocab_size = len(tgt_vocab)
-
+idx2word = {i: w for i, w in enumerate(tgt_vocab)}
 src_len = 5 #输入句子中最多单词数
 tgt_len = 6 #解码器输入（输出）句子中最多单词数
 
@@ -52,7 +53,7 @@ class MyDataSet(Data.Dataset):
                 self.dec_outputs = dec_outputs
         def  __len__(self):
                 return self.enc_inputs.shape[0]
-        def __getattr__(self, idx):
+        def __getitem__(self, idx):
                 return self.enc_inputs[idx],self.dec_inputs[idx],self.dec_outputs[idx]
 # 构建DataLoader对象
 # 参数：
@@ -196,6 +197,85 @@ class Encoder(nn.Module):
                         enc_self_attns.append(enc_self_attn)
                 return enc_outputs,enc_self_attns
 
+# Decoder Layer
+class DecoderLayer(nn.Module):
+        def __init__(self):
+                super(DecoderLayer, self).__init__()
+                self.dec_self_attn = MultiHeadAttention()
+                self.dec_enc_attn = MultiHeadAttention()
+                self.pos_ffn = PoswiseFeedForwardNet()
+
+        def forward(self,dec_inputs,enc_outputs,dec_self_attn_mask,dec_enc_attn_mask):
+                dec_outputs,dec_self_attn = self.dec_self_attn(dec_inputs,dec_inputs,dec_inputs,dec_self_attn_mask)
+                dec_outputs,dec_enc_attn = self.dec_enc_attn(dec_outputs,enc_outputs,enc_outputs,dec_enc_attn_mask)
+                dec_outputs = self.pos_ffn(dec_outputs)
+                return dec_outputs,dec_self_attn,dec_enc_attn
+
+#Decoder
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder, self).__init__()
+        self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
+        self.pos_emb = nn.Embedding.from_pretrained(get_sinusoid_encodingg_table(tgt_vocab_size, d_model),freeze=True)
+        self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
+
+    def forward(self, dec_inputs, enc_inputs, enc_outputs):
+        '''
+        dec_inputs: [batch_size, tgt_len]
+        enc_intpus: [batch_size, src_len]
+        enc_outputs: [batsh_size, src_len, d_model]
+        '''
+        word_emb = self.tgt_emb(dec_inputs) # [batch_size, tgt_len, d_model]
+        pos_emb = self.pos_emb(dec_inputs) # [batch_size, tgt_len, d_model]
+        dec_outputs = word_emb + pos_emb
+        dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs) # [batch_size, tgt_len, tgt_len]
+        dec_self_attn_subsequent_mask = get_attn_subsequence_mask(dec_inputs) # [batch_size, tgt_len]
+        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_subsequent_mask), 0) # [batch_size, tgt_len, tgt_len]
+
+        dec_enc_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs) # [batc_size, tgt_len, src_len]
+
+        dec_self_attns, dec_enc_attns = [], []
+        for layer in self.layers:
+            # dec_outputs: [batch_size, tgt_len, d_model], dec_self_attn: [batch_size, n_heads, tgt_len, tgt_len], dec_enc_attn: [batch_size, h_heads, tgt_len, src_len]
+            dec_outputs, dec_self_attn, dec_enc_attn = layer(dec_outputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask)
+            dec_self_attns.append(dec_self_attn)
+            dec_enc_attns.append(dec_enc_attn)
+        return dec_outputs, dec_self_attns, dec_enc_attns
+
+# Transformer
+class Transformer(nn.Module):
+        def __init__(self):
+                super(Transformer, self).__init__()
+                self.encoder = Encoder()
+                self.decoder = Decoder()
+                self.projection = nn.Linear(d_model,tgt_vocab_size,bias=False)
+        def forward(self,enc_inputs,dec_inputs):
+                enc_outputs,enc_self_attns = self.encoder(enc_inputs)
+                dec_outputs,dec_self_attns,dec_enc_attns = self.decoder(dec_inputs,enc_inputs,enc_outputs)
+                dec_logits = self.projection(dec_outputs)
+                return dec_logits.view(-1,dec_logits.size(-1)),enc_self_attns,dec_enc_attns
+        
+
+model = Transformer()
+criterion = nn.CrossEntropyLoss(ignore_index=0)
+optimizer = optim.SGD(model.parameters(),lr=1e-3,momentum=0.99)
+
+
+# 训练
+for epoch in range(30):
+        for enc_inputs,dec_inputs,dec_outputs in loader:
+                outputs,enc_self_attns,dec_self_attns = model(enc_inputs,dec_inputs)
+                loss = criterion(outputs,dec_outputs.view(-1))
+                print("Epoch:","%04d"%(epoch + 1),'loss=','{:.6f}'.format(loss))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        
+# 测试
+enc_inputs,dec_inputs,_ = next(iter(loader))
+predict,_,_ = model(enc_inputs[0].view(1,-1),dec_inputs[0].view(1,-1))
+predict = predict.data.max(1,keepdim=True)[1]
+print(enc_inputs[0],'->',[idx2word[n.item()] for n in predict.squeeze()])
 
 
 
